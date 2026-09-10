@@ -17,6 +17,7 @@ import spack.spec
 from spack.config import Configuration
 from spack.main import SpackCommand, SpackCommandError
 from spack.store import Store
+from spack.util import tty
 
 buildcache = SpackCommand("buildcache")
 install = SpackCommand("install")
@@ -40,6 +41,25 @@ def test_spec():
     assert "libdwarf@20130729" in output
     assert "libelf@0.8.1" in output
     assert "mpich@3.0.4" in output
+
+
+def test_spec_verbose_shows_concretizer_progress(monkeypatch):
+    """``spack -v spec`` reports setup/solve progress on the way to a tree."""
+
+    def _force_verbose(flag: bool) -> None:
+        tty._verbose = True
+
+    monkeypatch.setattr(tty, "set_verbose", _force_verbose)
+    monkeypatch.setattr(tty, "_verbose", True)
+    output = spec("--no-install-status", "dtbuild1")
+
+    assert "Concretizing dtbuild1" in output
+    assert "reuse candidates" in output
+    assert "possible packages" in output
+    assert "package rules" in output
+    assert "dtbuild1@1.0" in output
+    # default (non-verbose) tree still present; progress must not replace it
+    assert "dtlink2" in output
 
 
 def test_spec_concretizer_args(mutable_database):

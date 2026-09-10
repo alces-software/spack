@@ -414,7 +414,10 @@ def make_argument_parser(**kwargs):
         help="when to colorize output (default: auto)",
     )
     general.add_argument(
-        "-v", "--verbose", action="store_true", help="print additional output during builds"
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="print additional output during builds and concretization",
     )
     general.add_argument(
         "-k",

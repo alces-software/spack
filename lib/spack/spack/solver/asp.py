@@ -97,6 +97,7 @@ from .error import (
     UnsatisfiableSpecError,
 )
 from .input_analysis import create_counter, create_graph_analyzer
+from .progress import ConcretizerProgress
 from .requirements import RequirementKind, RequirementOrigin, RequirementParser, RequirementRule
 from .result import Result, SpecDict, build_criteria_names
 from .reuse import ReusableSpecsSelector, SpecFiltersFactory
@@ -705,15 +706,18 @@ class PyclingoDriver:
         problem_str: str,
         control_file_paths: List[str],
         timer: spack.util.timer.Timer,
+        progress: Optional[ConcretizerProgress] = None,
     ) -> Result:
         """Actually run clingo and generate a result.
 
         This is the core solve logic once the setup is done and once we know we can't
         fetch a result from cache. See ``solve()`` for caching and setup logic.
         """
+        progress = progress or ConcretizerProgress()
         # We could just take the cache_key and add it to clingo (since it is the
         # full problem representation), but we load control files separately as it
         # makes clingo give us better, file-aware error messages.
+        progress.phase("loading")
         with timer.measure("load"):
             # Add the problem instance
             self.control.add("base", [], problem_str)
@@ -723,6 +727,7 @@ class PyclingoDriver:
 
         # Grounding is the first step in the solve -- it turns our facts
         # and first-order logic rules into propositional logic.
+        progress.phase("grounding")
         with timer.measure("ground"):
             self.control.ground([("base", [])])
 
@@ -732,7 +737,9 @@ class PyclingoDriver:
         def on_model(model):
             models.append((model.cost, model.symbols(shown=True, terms=True)))
 
+        progress.phase("solving")
         timer.start("solve")
+        solve_start = time.monotonic()
         # A timeout of 0 means no timeout
         time_limit = setup.context.config.get("concretizer:timeout", 0)
         timeout_end = time.monotonic() + time_limit if time_limit > 0 else float("inf")
@@ -747,6 +754,7 @@ class PyclingoDriver:
             finished = False
             while not finished and time.monotonic() < timeout_end:
                 finished = handle.wait(1.0)
+                progress.heartbeat(time.monotonic() - solve_start, len(models))
 
             if not finished:
                 specs_str = ", ".join(spack.util.lang.elide_list([str(s) for s in specs], 4))
@@ -758,6 +766,10 @@ class PyclingoDriver:
 
             solve_result = handle.get()
         timer.stop("solve")
+        elapsed = time.monotonic() - solve_start
+        nmodels = len(models)
+        models_word = "model" if nmodels == 1 else "models"
+        progress.done(f"solved in {elapsed:.1f}s ({nmodels} {models_word})")
 
         # once done, construct the solve result
         result = Result(specs, repo=setup.context.repo)
@@ -844,12 +856,43 @@ class PyclingoDriver:
         if setup.enable_splicing:
             control_files.append("splices.lp")
 
+        with ConcretizerProgress() as progress:
+            return self._solve(
+                setup,
+                specs,
+                reuse=reuse,
+                packages_with_externals=packages_with_externals,
+                output=output,
+                control=control,
+                allow_deprecated=allow_deprecated,
+                timer=timer,
+                control_files=control_files,
+                progress=progress,
+            )
+
+    def _solve(
+        self,
+        setup: "SpackSolverSetup",
+        specs: List[spack.spec.Spec],
+        reuse: Optional[List[spack.spec.Spec]],
+        packages_with_externals,
+        output: OutputConfiguration,
+        control: Optional[Any],
+        allow_deprecated: bool,
+        timer: spack.util.timer.Timer,
+        control_files: List[str],
+        progress: ConcretizerProgress,
+    ) -> Tuple[Result, Optional[spack.util.timer.Timer], Optional[Dict]]:
+        spec_list = ", ".join(elide_list([str(s) for s in specs], 4))
+        progress.phase(f"Concretizing {spec_list}")
+
         timer.start("setup")
         problem_builder = setup.setup(
             specs,
             reuse=reuse,
             packages_with_externals=packages_with_externals,
             allow_deprecated=allow_deprecated,
+            progress=progress,
         )
         timer.stop("setup")
 
@@ -891,13 +934,17 @@ class PyclingoDriver:
         if result is None:
             self.control = control or default_clingo_control()
             tty.debug("Starting concretizer")
-            result = self._run_clingo(specs, setup, problem_str, control_file_paths, timer)
+            result = self._run_clingo(
+                specs, setup, problem_str, control_file_paths, timer, progress=progress
+            )
             result.raise_if_unsat()
             concretization_stats = self.control.statistics
 
             # write result back to the cache *before* post-processing
             if cache and cache_key is not None:
                 cache.store(cache_key, result, self.control.statistics)
+        else:
+            progress.phase("using cached concretization")
 
         # apply post-concretization transformations
         for _, _, spec_dict in result.answers:
@@ -2368,6 +2415,7 @@ class SpackSolverSetup:
         reuse: Optional[List[spack.spec.Spec]] = None,
         packages_with_externals=None,
         allow_deprecated: bool = False,
+        progress: Optional[ConcretizerProgress] = None,
     ) -> "ProblemInstanceBuilder":
         """Generate an ASP program with relevant constraints for specs.
 
@@ -2380,11 +2428,13 @@ class SpackSolverSetup:
             reuse: list of concrete specs that can be reused
             packages_with_externals: precomputed packages config with implicit externals
             allow_deprecated: if True adds deprecated versions into the solve
+            progress: optional verbose progress reporter
 
         Return:
             A ProblemInstanceBuilder populated with facts and rules for an ASP solve.
         """
         reuse = reuse or []
+        progress = progress or ConcretizerProgress()
         if packages_with_externals is None:
             packages_with_externals = (
                 spack.externals_config.external_config_with_implicit_externals(self.context)
@@ -2421,6 +2471,7 @@ class SpackSolverSetup:
             )
             if x not in reused_set
         ]
+        progress.count(len(reuse), "reuse candidates")
 
         candidate_compilers.update(compilers_from_reuse)
         self.possible_compilers = list(candidate_compilers)
@@ -2475,7 +2526,9 @@ class SpackSolverSetup:
         self.define_concrete_input_specs(specs, self.pkgs)
         if reuse:
             self.gen.fact(fn.optimize_for_reuse())
-            for reusable_spec in reuse:
+            n_reuse = len(reuse)
+            for i, reusable_spec in enumerate(reuse, 1):
+                progress.item("reuse", i, n_reuse, reusable_spec.name)
                 self.register_concrete_spec(reusable_spec, self.pkgs)
         # Registered after the reuse list, so that a dependency of an installed compiler that
         # is also reusable on its own keeps being selectable.
@@ -2521,7 +2574,11 @@ class SpackSolverSetup:
         )
 
         self.gen.h1("Package Constraints")
-        for pkg in sorted(self.pkgs):
+        pkgs = sorted(self.pkgs)
+        n_pkgs = len(pkgs)
+        progress.count(n_pkgs, "possible packages")
+        for i, pkg in enumerate(pkgs, 1):
+            progress.item("package rules", i, n_pkgs, pkg)
             self.gen.h2(f"Package rules: {pkg}")
             self.pkg_rules(pkg, tests=self.tests)
             self.preferred_variants(pkg)
